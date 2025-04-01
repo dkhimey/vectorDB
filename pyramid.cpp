@@ -53,7 +53,7 @@ private:
         for (size_t i = 0; i < dim; i++) {
             dist += (a[i] - b[i]) * (a[i] - b[i]);
         }
-        return std::sqrt(dist); //TODO: could use squared distance instead
+        return dist;
     }
 
     float computeInnerProductDistance(float* a, float* b) {
@@ -97,8 +97,15 @@ private:
         return true;
     }
 
+    std::vector<float*> alsh(float* vec, size_t r) {
+        // TODO: can probably pass a pointer and push directly to existing list
+        std::vector<float*> result;
+
+        return result;
+    }
+
     void kmeans(float* sample, size_t nPrime, size_t m_centers, float* centers) {
-        // Initialize centers to the first m vectors from sample (TODO: sample must be normalized??)
+        // Initialize centers to the first m vectors from sample
         std::copy(sample, sample + m_centers * dim, centers);
 
         for (int iter = 0; iter < KMEANS_EPOCHS; iter++) {
@@ -145,7 +152,8 @@ public:
     Pyramid(float* X, size_t max_elements, size_t dim, size_t w_partitions, size_t ef_construction, bool mips = false) : 
             X(X), max_elements(max_elements), dim(dim), 
             w_partitions(w_partitions), ef_construction(ef_construction),
-            gen(std::random_device{}()) {
+            gen(42) {
+            // gen(std::random_device{}()) {
                 sub_HNSWs = new hnswlib::HierarchicalNSW<float>*[w_partitions];
                 X_partitions = new std::vector<float*>[w_partitions];
 
@@ -160,11 +168,15 @@ public:
                 }
             }
 
-    // ~Pyramid() {
-    //     delete meta_HNSW;
-    //     // TODO actually delete the individual sub_HNSWs as well
-    //     delete[] sub_HNSWs;
-    // }
+    ~Pyramid() {
+        delete meta_HNSW;
+        for (int i = 0; i < w_partitions; i++){
+            delete sub_HNSWs[i];
+        }
+        delete[] sub_HNSWs;
+        delete[] X_partitions;
+        delete space;
+    }
 
     void buildPyramid(size_t nPrime,
                        size_t M_meta,
@@ -184,9 +196,11 @@ public:
                 normalizeVec(sample + i * dim, norm_sample + i * dim);
             }
             kmeans(norm_sample, nPrime, m_centers, centers);
-            // TODO: free norm_sample
+            delete[] norm_sample;
         }
         else kmeans(sample, nPrime, m_centers, centers);
+
+        delete[] sample;
 
         // 3. build meta-HNSW on the centers
         meta_HNSW = new hnswlib::HierarchicalNSW<float>(space, m_centers, M_meta, ef_construction);
@@ -206,6 +220,8 @@ public:
             std::cout << "Recall: " << correct << "/" << m_centers << " = " << recall << "\n";
             printf("    Levels: %i\n", meta_HNSW->maxlevel_);
         }
+
+        delete[] centers;
 
         // 4. partition the bottom layer into w partitions
         std::vector<int> xadj;
@@ -234,15 +250,40 @@ public:
         kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(), 
                &w_partitions_int, &imbalance, true, gen(), FAST, &edge_cut, partitions.data());   
                
+        // 5. assign each vector to partition
+        float* norm_element = new float;
+        for (size_t i = 0; i < max_elements; i++) {
+            std::priority_queue<std::pair<float, hnswlib::labeltype>> result;
+            if (normalize) {
+                normalizeVec(X + i * dim, norm_element);
+                result = meta_HNSW->searchKnn(norm_element, 1);
+            } else {
+                result = meta_HNSW->searchKnn(X + i * dim, 1);
+            }
+            hnswlib::labeltype label = result.top().second;
+            X_partitions[partitions[label]].push_back(X + i * dim); //WARNING: adding non-normed vec!!
+        }
+        delete norm_element;
+
+        // 5.5. MIPs ONLY 
+        //      for each vector in partition i, 
+        //      find the top r MIPs neighbors in dataset, 
+        //      add neighbors to X_i
+        if (mips) {
+            for (size_t i = 0; i < w_partitions; i++) {
+                int n = X_partitions[i].size();
+                for (int j = 0; j < n; j++) {
+                    // find top r neighbors
+                    int r = w_partitions;
+                    for (float* neighbor: alsh(X_partitions[i][j], r)) {
+                        X_partitions[i].push_back(neighbor);
+                    }
+                }
+            }
+        }
+
         printf("MIPS success here\n");
         if (mips) return;
-
-        // 5. assign each vector to partition
-        for (size_t i = 0; i < max_elements; i++) {
-            std::priority_queue<std::pair<float, hnswlib::labeltype>> result = meta_HNSW->searchKnn(X + i * dim, 1);
-            hnswlib::labeltype label = result.top().second;
-            X_partitions[partitions[label]].push_back(X + i * dim);
-        }
 
         // 6. build sub_HNSW on each partition X_i
         size_t M_sub = M_meta; // TODO 
@@ -332,7 +373,8 @@ int main(){
 
     // Generate random data
     std::mt19937 rng;
-    rng.seed(std::random_device{}());
+    rng.seed(42);
+    // rng.seed(std::random_device{}());
     std::uniform_real_distribution<> distrib_real;
     float* X = new float[max_elements * dim];
     for (int i = 0; i < max_elements * dim; i++) {
@@ -340,10 +382,11 @@ int main(){
     }
 
     Pyramid p(X, max_elements, dim, w_partitions, ef_construction);
-    p.buildPyramid(nPrime, M_meta, m_centers, true, true);
+    p.buildPyramid(nPrime, M_meta, m_centers, false, true);
     // float* element = new float[dim];
     // std::copy(X, X + dim, element);
     // p.searchPyramid(X, 5, 10);
 
-    // p.testPyramid();
+    p.testPyramid();
+    delete[] X;
 }
