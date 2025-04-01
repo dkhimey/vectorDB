@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <vector>
 #include <set>
+#include <functional>
 #include "external/hnswlib/hnswlib/hnswlib.h"
 #include "external/KaHIP/interface/kaHIP_interface.h"
 
@@ -15,12 +16,18 @@ private:
     size_t max_elements;
     size_t dim;
     size_t w_partitions;
+
     size_t ef_construction;
+    hnswlib::SpaceInterface<float>* space;
+    std::function<float(float*, float*)> computeDistance;
+    bool normalize;
+
+    std::vector<int> partitions;
+    std::vector<float*>* X_partitions;
+
     hnswlib::HierarchicalNSW<float>* meta_HNSW;
     hnswlib::HierarchicalNSW<float>** sub_HNSWs;
-    std::vector<int> partitions;
-    hnswlib::L2Space* space;
-    std::vector<float*>* X_partitions;
+    
     std::mt19937 gen;
 
 
@@ -41,12 +48,39 @@ private:
         }
     }
 
-    float computeDistance(float* a, float* b) {
+    float computeEucleadianDistance(float* a, float* b) {
         float dist = 0.0f;
         for (size_t i = 0; i < dim; i++) {
             dist += (a[i] - b[i]) * (a[i] - b[i]);
         }
         return std::sqrt(dist); //TODO: could use squared distance instead
+    }
+
+    float computeInnerProductDistance(float* a, float* b) {
+        float dot = 0.0f;
+        for (size_t i = 0; i < dim; i++) {
+            dot += a[i] * b[i];
+        }
+        return 1.0 - dot;
+    }
+
+    float computeCosineSimilarity(float* a, float* b) {
+        float dot = 0.0f, normA = 0.0f, normB = 0.0f;
+        for (size_t i = 0; i < dim; i++) {
+            dot += a[i] * b[i];
+            normA += a[i] * a[i];
+            normB += b[i] * b[i];
+        }
+        return dot / (std::sqrt(normA) * std::sqrt(normB)); 
+    }
+
+    void normalizeVec(float* data, float* norm_array) {
+        float norm = 0.0f;
+        for (int i = 0; i < dim; i++)
+            norm += data[i] * data[i];
+        norm = 1.0f / (sqrtf(norm) + 1e-30f);
+        for (int i = 0; i < dim; i++)
+            norm_array[i] = data[i] * norm;
     }
 
     void printVector(float* v, size_t d) {
@@ -64,7 +98,7 @@ private:
     }
 
     void kmeans(float* sample, size_t nPrime, size_t m_centers, float* centers) {
-        // Initialize centers to the first m vectors from sample
+        // Initialize centers to the first m vectors from sample (TODO: sample must be normalized??)
         std::copy(sample, sample + m_centers * dim, centers);
 
         for (int iter = 0; iter < KMEANS_EPOCHS; iter++) {
@@ -78,7 +112,7 @@ private:
                 size_t bestCenter = 0;
                 // distance beteween point and centers[0]
                 float bestDist = computeDistance(point, centers);
-                for (size_t c = 0; c < m_centers; c++) {
+                for (size_t c = 1; c < m_centers; c++) {
                     float dist = computeDistance(point, centers + c*dim);
                     if (dist < bestDist) {
                         bestDist = dist;
@@ -101,19 +135,29 @@ private:
                     for (size_t d = 0; d < dim; d++) {
                         center[d] = newCenter[d] / counts[c];
                     }
+                    if (normalize) normalizeVec(center, center);
                 }
             }
         }
     }
 
 public:
-    Pyramid(float* X, size_t max_elements, size_t dim, size_t w_partitions, size_t ef_construction) : 
+    Pyramid(float* X, size_t max_elements, size_t dim, size_t w_partitions, size_t ef_construction, bool mips = false) : 
             X(X), max_elements(max_elements), dim(dim), 
             w_partitions(w_partitions), ef_construction(ef_construction),
             gen(std::random_device{}()) {
-                space = new hnswlib::L2Space(dim);
                 sub_HNSWs = new hnswlib::HierarchicalNSW<float>*[w_partitions];
                 X_partitions = new std::vector<float*>[w_partitions];
+
+                if (mips) {
+                    space = new hnswlib::InnerProductSpace(dim);
+                    normalize = true;
+                    computeDistance = [this](float* a, float* b) { return computeInnerProductDistance(a, b); };
+                } else {
+                    space = new hnswlib::L2Space(dim);
+                    normalize = false;
+                    computeDistance = [this](float* a, float* b) { return computeEucleadianDistance(a, b); };
+                }
             }
 
     // ~Pyramid() {
@@ -125,6 +169,7 @@ public:
     void buildPyramid(size_t nPrime,
                        size_t M_meta,
                        size_t m_centers,
+                       bool mips = false,
                        bool check_recalls = false) {
         // 1. sample n' items from dataset
         float* sample = new float[nPrime * dim];
@@ -132,23 +177,31 @@ public:
 
         // 2. run k-means with m centers
         float* centers = new float[m_centers * dim];
-        kmeans(sample, nPrime, m_centers, centers);
+
+        if (mips) {
+            float* norm_sample = new float[nPrime * dim];
+            for (size_t i = 0; i < nPrime; i++) {
+                normalizeVec(sample + i * dim, norm_sample + i * dim);
+            }
+            kmeans(norm_sample, nPrime, m_centers, centers);
+            // TODO: free norm_sample
+        }
+        else kmeans(sample, nPrime, m_centers, centers);
 
         // 3. build meta-HNSW on the centers
         meta_HNSW = new hnswlib::HierarchicalNSW<float>(space, m_centers, M_meta, ef_construction);
         for (int i = 0; i < m_centers; i++) {
             meta_HNSW->addPoint(centers + i * dim, i);
         }
-
-        // check the HNSW recall
-        float correct = 0;
-        for (int i = 0; i < m_centers; i++) {
-            std::priority_queue<std::pair<float, hnswlib::labeltype>> result = meta_HNSW->searchKnn(centers + i * dim, 1);
-            hnswlib::labeltype label = result.top().second;
-            if (label == i) correct++;
-        }
         
         if (check_recalls) {
+            // check the HNSW recall
+            float correct = 0;
+            for (int i = 0; i < m_centers; i++) {
+                std::priority_queue<std::pair<float, hnswlib::labeltype>> result = meta_HNSW->searchKnn(centers + i * dim, 1);
+                hnswlib::labeltype label = result.top().second;
+                if (label == i) correct++;
+            }
             float recall = correct / m_centers;
             std::cout << "Recall: " << correct << "/" << m_centers << " = " << recall << "\n";
             printf("    Levels: %i\n", meta_HNSW->maxlevel_);
@@ -179,7 +232,10 @@ public:
         partitions = std::vector<int>(m_centers, -1);
         // run Karlsuhe partitioning algorithm
         kaffpa(&m_centers_int, nullptr, xadj.data(), nullptr, adjncy.data(), 
-               &w_partitions_int, &imbalance, true, gen(), FAST, &edge_cut, partitions.data());      
+               &w_partitions_int, &imbalance, true, gen(), FAST, &edge_cut, partitions.data());   
+               
+        printf("MIPS success here\n");
+        if (mips) return;
 
         // 5. assign each vector to partition
         for (size_t i = 0; i < max_elements; i++) {
@@ -284,10 +340,10 @@ int main(){
     }
 
     Pyramid p(X, max_elements, dim, w_partitions, ef_construction);
-    p.buildPyramid(nPrime, M_meta, m_centers);
-    float* element = new float[dim];
-    std::copy(X, X + dim, element);
-    p.searchPyramid(X, 5, 10);
+    p.buildPyramid(nPrime, M_meta, m_centers, true, true);
+    // float* element = new float[dim];
+    // std::copy(X, X + dim, element);
+    // p.searchPyramid(X, 5, 10);
 
-    p.testPyramid();
+    // p.testPyramid();
 }
